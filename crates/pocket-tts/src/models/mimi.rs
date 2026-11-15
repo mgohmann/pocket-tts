@@ -68,20 +68,60 @@ impl MimiModel {
         name: &str,
         vb: VarBuilder,
     ) -> Result<Self> {
+        Self::new_with_dims(
+            encoder,
+            decoder,
+            encoder_transformer,
+            decoder_transformer,
+            frame_rate,
+            encoder_frame_rate,
+            sample_rate,
+            channels,
+            dimension,
+            output_dimension,
+            output_dimension,
+            None,
+            None,
+            name,
+            vb,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_dims(
+        encoder: SEANetEncoder,
+        decoder: SEANetDecoder,
+        encoder_transformer: ProjectedTransformer,
+        decoder_transformer: ProjectedTransformer,
+        frame_rate: f64,
+        encoder_frame_rate: f64,
+        sample_rate: usize,
+        channels: usize,
+        dimension: usize,
+        output_dimension: usize,
+        encoder_dimension: usize,
+        inner_dim: Option<usize>,
+        outer_dim: Option<usize>,
+        name: &str,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         let quantizer = Quantizer::new(dimension, output_dimension, vb.pp("quantizer"))?;
 
         let (downsample, upsample) = if encoder_frame_rate != frame_rate {
             let stride = (encoder_frame_rate / frame_rate) as usize;
+            let ds_out = inner_dim.unwrap_or(encoder_dimension);
+            let us_dim = outer_dim.unwrap_or(output_dimension);
             (
-                Some(ConvDownsample1d::new(
+                Some(ConvDownsample1d::new_with_dims(
                     stride,
-                    output_dimension,
+                    encoder_dimension,
+                    ds_out,
                     &format!("{}.downsample", name),
                     vb.pp("downsample"),
                 )?),
                 Some(ConvTrUpsample1d::new(
                     stride,
-                    output_dimension,
+                    us_dim,
                     &format!("{}.upsample", name),
                     vb.pp("upsample"),
                 )?),

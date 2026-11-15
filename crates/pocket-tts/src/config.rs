@@ -3,11 +3,17 @@
 use serde::Deserialize;
 use std::path::Path;
 
+fn default_flow_type() -> String {
+    "lsd".to_string()
+}
+
 /// Flow network configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct FlowConfig {
     pub dim: usize,
     pub depth: usize,
+    #[serde(rename = "type", default = "default_flow_type")]
+    pub flow_type: String,
 }
 
 /// Transformer configuration for FlowLM
@@ -38,6 +44,10 @@ pub struct FlowLMConfig {
     pub lookup_table: LookupTableConfig,
     #[serde(default)]
     pub weights_path: Option<String>,
+    #[serde(default)]
+    pub z_dim: Option<usize>,
+    #[serde(default)]
+    pub insert_bos_before_voice: bool,
 }
 
 /// SEANet encoder/decoder configuration
@@ -90,8 +100,16 @@ pub struct MimiConfig {
     pub channels: usize,
     pub frame_rate: f64,
     pub seanet: SEANetConfig,
+    #[serde(default)]
+    pub decoder_seanet: Option<SEANetConfig>,
     pub transformer: MimiTransformerConfig,
+    #[serde(default)]
+    pub decoder_transformer: Option<MimiTransformerConfig>,
     pub quantizer: QuantizerConfig,
+    #[serde(default)]
+    pub inner_dim: Option<usize>,
+    #[serde(default)]
+    pub outer_dim: Option<usize>,
     #[serde(default)]
     pub weights_path: Option<String>,
 }
@@ -105,6 +123,10 @@ pub struct Config {
     pub weights_path: Option<String>,
     #[serde(default)]
     pub weights_path_without_voice_cloning: Option<String>,
+    #[serde(default)]
+    pub default_temperature: Option<f32>,
+    #[serde(default)]
+    pub default_eos_threshold: Option<f32>,
 }
 
 /// Load configuration from a YAML file

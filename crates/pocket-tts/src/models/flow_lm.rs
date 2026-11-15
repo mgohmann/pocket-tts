@@ -21,6 +21,14 @@ pub fn lsd_decode(
     Ok(current)
 }
 
+pub fn drifting_decode(
+    flow_net: &SimpleMLPAdaLN,
+    modulations: &[ModulationParams],
+    x_0: &Tensor,
+) -> Result<Tensor> {
+    flow_net.forward_step_cached(x_0, modulations)
+}
+
 #[derive(Clone)]
 pub struct FlowLMModel {
     pub flow_net: SimpleMLPAdaLN,
@@ -28,11 +36,14 @@ pub struct FlowLMModel {
     pub input_linear: Linear,
     pub out_norm: LayerNorm,
     pub out_eos: Linear,
+    pub z_proj: Option<Linear>,
+    pub bos_before_voice: Option<Tensor>,
     pub bos_emb: Tensor,
     pub emb_mean: Tensor,
     pub emb_std: Tensor,
     pub ldim: usize,
     pub dim: usize,
+    pub flow_type: String,
     pub noise_clamp: Option<f32>,
 }
 
@@ -72,9 +83,42 @@ impl FlowLMModel {
         dim: usize,
         vb: VarBuilder,
     ) -> Result<Self> {
+        Self::new_with_options(
+            flow_net,
+            transformer,
+            ldim,
+            dim,
+            None,
+            false,
+            "lsd".to_string(),
+            vb,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_options(
+        flow_net: SimpleMLPAdaLN,
+        transformer: StreamingTransformer,
+        ldim: usize,
+        dim: usize,
+        z_dim: Option<usize>,
+        insert_bos_before_voice: bool,
+        flow_type: String,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         let input_linear = candle_nn::linear_no_bias(ldim, dim, vb.pp("input_linear"))?;
         let out_norm = LayerNorm::new(dim, 1e-5, true, vb.pp("out_norm"))?;
-        let out_eos = candle_nn::linear(dim, 1, vb.pp("out_eos"))?;
+        let cond_dim = z_dim.unwrap_or(dim);
+        let z_proj = match z_dim {
+            Some(zd) => Some(candle_nn::linear_no_bias(dim, zd, vb.pp("z_proj"))?),
+            None => None,
+        };
+        let out_eos = candle_nn::linear(cond_dim, 1, vb.pp("out_eos"))?;
+        let bos_before_voice = if insert_bos_before_voice {
+            Some(vb.get((1, 1, dim), "bos_before_voice")?)
+        } else {
+            None
+        };
         let bos_emb = vb.get(ldim, "bos_emb")?;
         let emb_mean = vb.get(ldim, "emb_mean")?;
         let emb_std = vb.get(ldim, "emb_std")?;
@@ -85,11 +129,14 @@ impl FlowLMModel {
             input_linear,
             out_norm,
             out_eos,
+            z_proj,
+            bos_before_voice,
             bos_emb,
             emb_mean,
             emb_std,
             ldim,
             dim,
+            flow_type,
             noise_clamp: None, // Default to no clamp
         })
     }
@@ -136,9 +183,14 @@ impl FlowLMModel {
             .narrow(1, transformer_out.dims()[1] - 1, 1)?
             .squeeze(1)?;
 
+        let cond = match &self.z_proj {
+            Some(zp) => zp.forward(&last_frame)?,
+            None => last_frame,
+        };
+
         let eos_score = self
             .out_eos
-            .forward(&last_frame)?
+            .forward(&cond)?
             .squeeze(0)?
             .squeeze(0)?
             .to_scalar::<f32>()?;
@@ -146,19 +198,23 @@ impl FlowLMModel {
 
         // Generate noise with optional clamping
         let noise = sample_noise(
-            last_frame.device(),
-            (last_frame.dims()[0], self.ldim),
+            cond.device(),
+            (cond.dims()[0], self.ldim),
             temp,
             self.noise_clamp,
         )?;
 
         // Pre-compute all modulations for this frame's ODE steps (8 steps * N blocks) in batch
-        let c_emb = self.flow_net.embed_condition(&last_frame)?;
+        let c_emb = self.flow_net.embed_condition(&cond)?;
         let modulations = self
             .flow_net
             .precompute_modulations(&c_emb, time_embeddings)?;
 
-        let next_latent = lsd_decode(&self.flow_net, &modulations, &noise)?;
+        let next_latent = if self.flow_type == "drifting" {
+            drifting_decode(&self.flow_net, &modulations[0], &noise)?
+        } else {
+            lsd_decode(&self.flow_net, &modulations, &noise)?
+        };
 
         Ok((next_latent, is_eos))
     }

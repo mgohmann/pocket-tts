@@ -105,6 +105,39 @@ impl TTSModel {
         )
     }
 
+    /// Load model from local config YAML, weights `.safetensors`, and tokenizer `.model` files.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn from_local_files<P: AsRef<std::path::Path>>(
+        config_path: P,
+        weights_path: P,
+        tokenizer_path: P,
+        device: &Device,
+    ) -> Result<Self> {
+        let config = load_config(config_path)?;
+        let temp = config.default_temperature.unwrap_or(defaults::TEMPERATURE);
+        let eos_threshold = config
+            .default_eos_threshold
+            .unwrap_or(defaults::EOS_THRESHOLD);
+        let tensors = candle_core::safetensors::load(weights_path, device)?;
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
+        let conditioner = LUTConditioner::new(
+            config.flow_lm.lookup_table.n_bins,
+            tokenizer_path.as_ref(),
+            config.flow_lm.lookup_table.dim,
+            config.flow_lm.transformer.d_model,
+            vb.pp("flow_lm.conditioner"),
+        )?;
+        Self::from_config_and_vb(
+            config,
+            temp,
+            defaults::LSD_DECODE_STEPS,
+            eos_threshold,
+            None,
+            conditioner,
+            vb,
+        )
+    }
+
     /// Load model with quantized weights for reduced memory footprint
     ///
     /// This applies simulated int8 quantization to applicable layers,
@@ -291,15 +324,21 @@ impl TTSModel {
         let dim = config.flow_lm.transformer.d_model;
         let ldim = config.mimi.quantizer.dimension;
         let hidden_dim = dim * config.flow_lm.transformer.hidden_scale;
+        let num_time_conds = if config.flow_lm.flow.flow_type == "drifting" {
+            0
+        } else {
+            2
+        };
+        let cond_dim = config.flow_lm.z_dim.unwrap_or(dim);
 
         // SimpleMLPAdaLN::new(in_channels, model_channels, out_channels, cond_channels, num_res_blocks, num_time_conds, max_period, vb)
         let flow_net = SimpleMLPAdaLN::new(
             ldim,                      // in_channels (input is latent dim)
             config.flow_lm.flow.dim,   // model_channels
             ldim,                      // out_channels (output is also latent dim)
-            dim,                       // cond_channels (conditioning from transformer)
+            cond_dim,                  // cond_channels (conditioning from transformer / z_proj)
             config.flow_lm.flow.depth, // num_res_blocks
-            2,                         // num_time_conds (s and t)
+            num_time_conds,
             config.flow_lm.transformer.max_period as f32,
             vb.pp("flow_lm.flow_net"),
         )?;
@@ -318,7 +357,16 @@ impl TTSModel {
             vb.pp("flow_lm.transformer"),
         )?;
 
-        let mut flow_lm = FlowLMModel::new(flow_net, transformer, ldim, dim, vb.pp("flow_lm"))?;
+        let mut flow_lm = FlowLMModel::new_with_options(
+            flow_net,
+            transformer,
+            ldim,
+            dim,
+            config.flow_lm.z_dim,
+            config.flow_lm.insert_bos_before_voice,
+            config.flow_lm.flow.flow_type.clone(),
+            vb.pp("flow_lm"),
+        )?;
         flow_lm.noise_clamp = noise_clamp;
 
         // Build Mimi components
@@ -339,24 +387,28 @@ impl TTSModel {
             vb.pp("mimi.encoder"),
         )?;
 
+        let dec_seanet_cfg = config
+            .mimi
+            .decoder_seanet
+            .as_ref()
+            .unwrap_or(&config.mimi.seanet);
         let decoder = SEANetDecoder::new(
-            seanet_cfg.channels,
-            seanet_cfg.dimension,
-            seanet_cfg.n_filters,
-            seanet_cfg.n_residual_layers,
-            &seanet_cfg.ratios,
-            seanet_cfg.kernel_size,
-            seanet_cfg.residual_kernel_size,
-            seanet_cfg.last_kernel_size,
-            seanet_cfg.dilation_base,
-            &seanet_cfg.pad_mode,
-            seanet_cfg.compress,
+            dec_seanet_cfg.channels,
+            dec_seanet_cfg.dimension,
+            dec_seanet_cfg.n_filters,
+            dec_seanet_cfg.n_residual_layers,
+            &dec_seanet_cfg.ratios,
+            dec_seanet_cfg.kernel_size,
+            dec_seanet_cfg.residual_kernel_size,
+            dec_seanet_cfg.last_kernel_size,
+            dec_seanet_cfg.dilation_base,
+            &dec_seanet_cfg.pad_mode,
+            dec_seanet_cfg.compress,
             "mimi.decoder",
             vb.pp("mimi.decoder"),
         )?;
 
         let mimi_tr_cfg = &config.mimi.transformer;
-        // ProjectedTransformer::new(input_dimension, output_dimensions, d_model, num_heads, num_layers, layer_scale, context, max_period, dim_feedforward, name, vb)
         let encoder_transformer = ProjectedTransformer::new(
             mimi_tr_cfg.input_dimension,
             mimi_tr_cfg.output_dimensions.clone(),
@@ -371,16 +423,21 @@ impl TTSModel {
             vb.pp("mimi.encoder_transformer"),
         )?;
 
+        let dec_tr_cfg = config
+            .mimi
+            .decoder_transformer
+            .as_ref()
+            .unwrap_or(&config.mimi.transformer);
         let decoder_transformer = ProjectedTransformer::new(
-            mimi_tr_cfg.input_dimension,
-            mimi_tr_cfg.output_dimensions.clone(),
-            mimi_tr_cfg.d_model,
-            mimi_tr_cfg.num_heads,
-            mimi_tr_cfg.num_layers,
-            mimi_tr_cfg.layer_scale as f32,
-            mimi_tr_cfg.context,
-            mimi_tr_cfg.max_period as f32,
-            mimi_tr_cfg.dim_feedforward,
+            dec_tr_cfg.input_dimension,
+            dec_tr_cfg.output_dimensions.clone(),
+            dec_tr_cfg.d_model,
+            dec_tr_cfg.num_heads,
+            dec_tr_cfg.num_layers,
+            dec_tr_cfg.layer_scale as f32,
+            dec_tr_cfg.context,
+            dec_tr_cfg.max_period as f32,
+            dec_tr_cfg.dim_feedforward,
             "mimi.decoder_transformer",
             vb.pp("mimi.decoder_transformer"),
         )?;
@@ -389,7 +446,7 @@ impl TTSModel {
         let hop_length: usize = seanet_cfg.ratios.iter().product();
         let encoder_frame_rate = config.mimi.sample_rate as f64 / hop_length as f64;
 
-        let mimi = MimiModel::new(
+        let mimi = MimiModel::new_with_dims(
             encoder,
             decoder,
             encoder_transformer,
@@ -400,13 +457,19 @@ impl TTSModel {
             config.mimi.channels,
             config.mimi.quantizer.dimension,
             config.mimi.quantizer.output_dimension,
+            seanet_cfg.dimension,
+            config.mimi.inner_dim,
+            config.mimi.outer_dim,
             "mimi",
             vb.pp("mimi"),
         )?;
 
-        // Load speaker projection weight - uses mimi output dimension, not internal ldim
-        let mimi_out_dim = config.mimi.quantizer.output_dimension;
-        let speaker_proj_weight = vb.get((dim, mimi_out_dim), "flow_lm.speaker_proj_weight")?;
+        // Load speaker projection weight - uses mimi inner_dim (if set) or output_dimension
+        let speaker_dim = config
+            .mimi
+            .inner_dim
+            .unwrap_or(config.mimi.quantizer.output_dimension);
+        let speaker_proj_weight = vb.get((dim, speaker_dim), "flow_lm.speaker_proj_weight")?;
 
         Ok(Self {
             flow_lm,
@@ -462,18 +525,67 @@ impl TTSModel {
         self.get_voice_state_from_tensor(&audio)
     }
 
-    /// Create voice state from a pre-calculated latent prompt file (.safetensors)
+    /// Create voice state from a pre-calculated latent prompt or KV-cache file (.safetensors)
     #[cfg(not(target_arch = "wasm32"))]
     pub fn get_voice_state_from_prompt_file<P: AsRef<std::path::Path>>(
         &self,
         path: P,
     ) -> Result<ModelState> {
         let tensors = candle_core::safetensors::load(path, &self.device)?;
-        let prompt = tensors
-            .get("audio_prompt")
-            .ok_or_else(|| anyhow::anyhow!("'audio_prompt' not found in safetensors file"))?;
+        if let Some(prompt) = tensors.get("audio_prompt") {
+            return self.get_voice_state_from_prompt_tensor(prompt);
+        }
 
-        self.get_voice_state_from_prompt_tensor(prompt)
+        // 18M RL voices store pre-computed FlowLM KV caches:
+        //   transformer.layers.{i}.self_attn/cache: [2, B, T, H, D]
+        //   transformer.layers.{i}.self_attn/offset: [1]
+        use crate::voice_state::{
+            AttentionCursor, ATTN_K_BUF_KEY, ATTN_V_BUF_KEY, write_attention_cursor,
+        };
+        let mut flow_state = init_states(1, 1000);
+        for (key, cache) in &tensors {
+            let Some(module_suffix) = key.strip_suffix("/cache") else {
+                continue;
+            };
+            let full_module = if module_suffix.starts_with("flow_lm.") {
+                module_suffix.to_string()
+            } else {
+                format!("flow_lm.{module_suffix}")
+            };
+            let k_buf = cache.get(0)?.permute((0, 2, 1, 3))?.contiguous()?;
+            let v_buf = cache.get(1)?.permute((0, 2, 1, 3))?.contiguous()?;
+            let offset_key = format!("{module_suffix}/offset");
+            let offset_len = if let Some(off) = tensors.get(&offset_key) {
+                let flat = off.flatten_all()?;
+                if let Ok(v) = flat.to_vec1::<i64>() {
+                    v.first().copied().unwrap_or(0).max(0) as usize
+                } else if let Ok(v) = flat.to_vec1::<u32>() {
+                    v.first().copied().unwrap_or(0) as usize
+                } else {
+                    k_buf.dim(2)?
+                }
+            } else {
+                k_buf.dim(2)?
+            };
+
+            let mut mod_map = std::collections::HashMap::new();
+            mod_map.insert(ATTN_K_BUF_KEY.to_string(), k_buf);
+            mod_map.insert(ATTN_V_BUF_KEY.to_string(), v_buf);
+            write_attention_cursor(
+                &mut mod_map,
+                AttentionCursor {
+                    pos: offset_len,
+                    len: offset_len,
+                    head: 0,
+                },
+                &self.device,
+            )?;
+            flow_state.insert(full_module, mod_map);
+        }
+        if flow_state.is_empty() {
+            anyhow::bail!("Neither 'audio_prompt' nor KV-cache tensors found in safetensors file");
+        }
+        Ok(flow_state)
     }
 
     /// Create voice state from pre-calculated latent prompt bytes (.safetensors)

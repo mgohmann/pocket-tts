@@ -282,9 +282,19 @@ pub struct ConvDownsample1d {
 
 impl ConvDownsample1d {
     pub fn new(stride: usize, dimension: usize, name: &str, vb: VarBuilder) -> Result<Self> {
+        Self::new_with_dims(stride, dimension, dimension, name, vb)
+    }
+
+    pub fn new_with_dims(
+        stride: usize,
+        in_dimension: usize,
+        out_dimension: usize,
+        name: &str,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         let conv = StreamingConv1d::new(
-            dimension,
-            dimension,
+            in_dimension,
+            out_dimension,
             2 * stride,
             stride,
             1,

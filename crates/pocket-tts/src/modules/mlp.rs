@@ -299,6 +299,10 @@ impl SimpleMLPAdaLN {
         device: &candle_core::Device,
         dtype: DType,
     ) -> Result<Tensor> {
+        if self.num_time_conds == 0 {
+            let model_channels = self.input_proj.weight().dim(0)?;
+            return Tensor::zeros((1, model_channels), dtype, device);
+        }
         let mut embeddings = Vec::with_capacity(num_steps);
         for i in 0..num_steps {
             let s = i as f64 / num_steps as f64;
